@@ -29,10 +29,16 @@ extern IMAGE_TLS_DIRECTORY _tls_used;
 
 static void *tls_block(void)
 {
+	/* The module's TLS block hangs off TEB->ThreadLocalStoragePointer, which
+	 * is 0x58 into a 64-bit TEB and 0x2C into a 32-bit one.  Finding the TEB
+	 * itself is per-architecture -- GS on x64, FS on x86, x18 on ARM64 -- and
+	 * NtCurrentTeb() is the spelling that is all three, so only the offset is
+	 * left to choose. */
+	char *teb = (char *)NtCurrentTeb();
 #ifdef _WIN64
-	void **tls_array = (void **)__readgsqword(0x58);
+	void **tls_array = *(void ***)(teb + 0x58);
 #else
-	void **tls_array = (void **)__readfsdword(0x2C);
+	void **tls_array = *(void ***)(teb + 0x2C);
 #endif
 	return tls_array[_tls_index];
 }

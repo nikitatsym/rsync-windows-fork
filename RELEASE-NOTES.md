@@ -22,9 +22,13 @@ What is in the zip
     NOTICE-ssh.txt            licences of what ssh.exe is built from
     RELEASE-NOTES.txt         this file
 
-rsync-windows-x64.zip is for 64-bit Windows.  rsync-windows-x86.zip is for
-32-bit Windows only: its ssh.exe cannot use the 64-bit libcrypto.dll that
-64-bit Windows provides.
+rsync-windows-x64.zip is for 64-bit Intel/AMD Windows,
+rsync-windows-arm64.zip for Windows on ARM, and rsync-windows-x86.zip for
+32-bit Windows.  Take the one built for the machine: a zip's ssh.exe loads
+the libcrypto.dll of its own architecture out of System32, and a Windows has
+only ever one of those.  (An ARM64 machine will run the x64 build under
+emulation, but then rsync falls back to the ssh on PATH and the transfer is
+held at ~17 MB/s.)
 
 
 Install
@@ -61,8 +65,8 @@ longer take many times longer than a full copy.
 
   - Ask for AES-GCM.  OpenSSH's default cipher, chacha20-poly1305, has no
     hardware acceleration and caps a transfer at roughly 150-170 MB/s on a
-    laptop; AES-GCM uses AES-NI and reaches the wire.  The cipher is chosen
-    by the side that starts the transfer:
+    laptop; AES-GCM uses the processor's AES instructions and reaches the
+    wire.  The cipher is chosen by the side that starts the transfer:
 
         rsync -rt -e "ssh -c aes128-gcm@openssh.com" src/ user@host:dst/
 
@@ -102,9 +106,14 @@ What changed since v3.5.0-gf800ace2
     Windows CNG gives up 6-11% of its throughput as the processor throttles
     and ISA-L gives up 1%, at the same clock and the same temperature.
     SSH_AESGCM_BACKEND=cng picks CNG, =libcrypto the original EVP path;
-    ssh -vvv says which one a build is using.  The assembly is 64-bit, so
+    ssh -vvv says which one a build is using.  The assembly is x86-64, so
     this is the x64 download; the x86 one keeps CNG, as does any machine
-    without AVX2, AES-NI and PCLMULQDQ.
+    without AVX2, AES-NI and PCLMULQDQ.  The ARM64 download keeps CNG as
+    well, and there that is the right answer rather than the leftover one:
+    CNG runs AES-128-GCM about 50 times faster than the ARM64
+    libcrypto.dll Windows ships, which carries no ARM64 assembly at all,
+    and about twice as fast as a hand-written implementation of the same
+    ARMv8 crypto instructions.
     The random padding drawn for every packet no longer takes a kernel
     mutex to do it, and each encrypted packet is handed to the socket
     thread rather than copied to it.  None of it shows on Ethernet; on a

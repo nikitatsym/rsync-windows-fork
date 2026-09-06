@@ -83,13 +83,25 @@ set(RSYNC_PLATFORM_INCLUDE "")
 set(RSYNC_PLATFORM_INCLUDE_DIR "")
 
 if(WIN32)
-    # The 64-bit build is the one people want, so it keeps the plain name; a
-    # 32-bit build is named for what it is, so both can sit in one directory
-    # and neither can be mistaken for the other.  The toolchain decides which
-    # this is -- with Ninja that is whichever vcvars was run -- and everything
-    # downstream (the version resource, the test suite, what CI ships) follows
-    # from these two variables rather than guessing again.
-    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # The x64 build is the one most people want, so it keeps the plain name;
+    # the other two are named for what they are, so all three can sit in one
+    # directory and none can be mistaken for another.  The toolchain decides
+    # which this is -- with Ninja that is whichever vcvars was run -- and
+    # everything downstream (the version resource, the test suite, what CI
+    # ships) follows from these two variables rather than guessing again.
+    #
+    # The compiler's own idea of its target, which is the only one of the two
+    # that survives cross-compiling: MSVC sets it to x64, X86 or ARM64.
+    # CMAKE_SYSTEM_PROCESSOR is the host's, and is the fallback for a compiler
+    # that leaves the other empty.
+    set(RSYNC_WIN_TARGET "${CMAKE_C_COMPILER_ARCHITECTURE_ID}")
+    if(NOT RSYNC_WIN_TARGET)
+        set(RSYNC_WIN_TARGET "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    if(RSYNC_WIN_TARGET MATCHES "^([aA][rR][mM]64|[aA][aA][rR][cC][hH]64)$")
+        set(RSYNC_WIN_ARCH "arm64")
+        set(RSYNC_EXE_NAME "rsync-arm64")
+    elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
         set(RSYNC_WIN_ARCH "x86")
         set(RSYNC_EXE_NAME "rsync-x86")
     else()
@@ -149,9 +161,14 @@ if(MSVC AND RSYNC_HARDEN)
                         # patterns that Spectre v1 preys on
     add_link_options(
         /guard:cf                  # the other half of CFG: emit the table
-        /CETCOMPAT                 # opt in to the CPU shadow stack where there
-                                   # is one, which defeats ROP at the return
         /DYNAMICBASE /NXCOMPAT)    # ASLR and DEP, pinned as above
+    if(NOT RSYNC_WIN_ARCH STREQUAL "arm64")
+        # Opt in to the CPU shadow stack where there is one, which defeats ROP
+        # at the return.  CET is an Intel/AMD feature, so the flag only means
+        # anything for an x86 image; asking for it on an ARM64 link is a hard
+        # error (LNK1246), the same way /HIGHENTROPYVA is on a 32-bit one.
+        add_link_options(/CETCOMPAT)
+    endif()
     if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         # 64-bit ASLR has nothing to randomise in a 32-bit address space, and
         # asking for it is a hard error (LNK1246) rather than a warning.  What
@@ -336,6 +353,8 @@ if(WIN32)
     set(RSYNC_RC_ORIGINAL_FILENAME "${RSYNC_EXE_NAME}.exe")
     if(RSYNC_WIN_ARCH STREQUAL "x86")
         set(RSYNC_RC_DESCRIPTION "rsync - fast incremental file transfer (32-bit)")
+    elseif(RSYNC_WIN_ARCH STREQUAL "arm64")
+        set(RSYNC_RC_DESCRIPTION "rsync - fast incremental file transfer (ARM64)")
     else()
         set(RSYNC_RC_DESCRIPTION "rsync - fast incremental file transfer")
     endif()
@@ -941,9 +960,9 @@ target_compile_definitions(rsync PRIVATE HAVE_CONFIG_H)
 target_link_libraries(rsync PRIVATE ${RSYNC_EXTRA_LIBS})
 
 if(WIN32)
-    # rsync.exe for x64, rsync-x86.exe for 32-bit.  Everything that consumes
-    # the binary goes through $<TARGET_FILE:rsync>, so this is the only place
-    # the name is decided.
+    # rsync.exe for x64, rsync-x86.exe for 32-bit, rsync-arm64.exe for ARM64.
+    # Everything that consumes the binary goes through $<TARGET_FILE:rsync>,
+    # so this is the only place the name is decided.
     set_target_properties(rsync PROPERTIES OUTPUT_NAME "${RSYNC_EXE_NAME}")
 
     target_link_libraries(rsync PRIVATE ws2_32 advapi32 shell32 userenv)

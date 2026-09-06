@@ -1,4 +1,5 @@
-# Build rsync for Windows -- x64 and x86 -- and publish both when tagged.
+# Build rsync for Windows -- x64, x86 and ARM64 -- and publish all three when
+# tagged.
 #
 # Every push builds, tests and uploads an artifact, so the branch is always
 # known to compile and a build is always downloadable from the run page.  Only
@@ -11,6 +12,13 @@
 # release per commit, pruned to the last three, and a tag per commit alongside
 # them; what someone actually wants there is the list of rsyncs this port has
 # shipped.
+#
+# One job per architecture, each on a runner of that architecture: x64 and x86
+# on windows-2022, ARM64 on windows-11-arm.  The x64 image can cross-compile
+# ARM64 -- it carries VC.Tools.ARM64 -- but nothing on it can *run* the result,
+# so that route would publish a binary no test had ever executed.  Every
+# binary here has been through the whole suite on the architecture it is for.
+# A publish job then gathers the three and cuts one release from them.
 #
 # This is the only workflow that runs on this branch.  Every other workflow in
 # .github/workflows/ is triggered by `push: branches: [ master ]`, and the
@@ -30,14 +38,27 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2022
-    name: Build rsync.exe and rsync-x86.exe
+    strategy:
+      # One architecture failing should not cancel the others: which of the
+      # three broke, and whether the other two still build, is the first thing
+      # anyone wants to know from a red run.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+          - arch: x86
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.arch }}
     steps:
     - uses: actions/checkout@v7
       with:
         # Not shallow: the version resource names the commit that was built,
         # which comes from git.  A depth-1 checkout still has HEAD, but the
-        # tag-agreement check below wants the tag object too.
+        # tag-agreement check in the release job wants the tag object too.
         fetch-depth: 0
         # openssh/ is Win32-OpenSSH, pinned; ssh.exe is built from it below.
         submodules: true
@@ -55,18 +76,21 @@ jobs:
     - name: Build and test
       shell: cmd
       # windows-build-and-test.bat finds MSVC through vswhere and calls the
-      # right vcvars itself, so no toolchain action is needed.  It defaults to
-      # --arch both: x64 into build-x64\, x86 into build-x86\, each configured,
-      # built and run through the test suite separately.  The ssh transfer
-      # tests skip on their own without RSYNC_WIN_TEST_HOST.
+      # right vcvars itself, so no toolchain action is needed.  --arch pins it
+      # to this job's architecture -- the script's default is all three, which
+      # is what a developer wants and not what a matrix leg does.  The suite
+      # runs natively here, so a build is only published if it passed on the
+      # architecture it is for.  The ssh transfer tests skip on their own
+      # without RSYNC_WIN_TEST_HOST.
       #
       # --config Release is the default, and is given anyway: a release must
       # never go out built as RelWithDebInfo (which is what to build locally
       # for profiling -- see BUILD-CMAKE.md), and the default is not the place
       # to decide that.  The staging step below refuses to ship a .pdb.
-      run: windows-build-and-test.bat --clean --config Release
+      run: windows-build-and-test.bat --clean --config Release --arch ${{ matrix.arch }}
 
     - name: Install NASM
+      if: matrix.arch == 'x64'
       shell: pwsh
       # Two AES-GCM objects from Intel's ISA-L are assembled with it
       # (win32/openssh/isal).  build-openssh.ps1 treats NASM as optional so
@@ -75,6 +99,10 @@ jobs:
       # release build installs it and passes -RequireIsal below: a release
       # that shipped without it would look identical and give up 8-11% of its
       # throughput once the machine is hot.
+      #
+      # x64 only: the assembly is win64, and there is nothing to assemble for
+      # the other two.  Both use CNG for AES-GCM, which on ARM64 is the right
+      # backend anyway -- see optimization/charts/ciphercharts_arm64.py.
       run: |
         if (Get-Command nasm -ErrorAction SilentlyContinue) {
           Write-Host "nasm already present: $((Get-Command nasm).Source)"
@@ -83,61 +111,81 @@ jobs:
           echo "C:\Program Files\NASM" >>$Env:GITHUB_PATH
         }
 
-    - name: Build ssh.exe, x64 and x86
+    - name: Build ssh.exe
       shell: pwsh
       # Win32-OpenSSH from the openssh/ submodule with the patches in
       # win32/openssh/patches: the client Windows ships reads its stdin 3KB
       # at a time, which held a push from a Windows machine at 17MB/s.  The
       # script builds against Microsoft's published LibreSSL 3.8.2 SDK -- the
       # same libcrypto.dll the Windows OpenSSH Client component puts in
-      # System32, which is what ssh.exe loads -- and leaves build-x64\ssh.exe and
-      # build-x86\ssh-x86.exe.  No DLL ships with either.
+      # System32, which is what ssh.exe loads, and which that SDK also
+      # provides for ARM64 -- and leaves it in this architecture's build
+      # directory.  No DLL ships with any of them.
       run: |
-        .\win32\openssh\build-openssh.ps1 -Arch both -RequireIsal
+        # -RequireIsal only where there is assembly to require.
+        $opt = @{}
+        if ('${{ matrix.arch }}' -eq 'x64') { $opt['RequireIsal'] = $true }
+        .\win32\openssh\build-openssh.ps1 -Arch ${{ matrix.arch }} @opt
         if ($LASTEXITCODE -ne 0) { exit 1 }
 
     - name: Check no upstream test was absorbed unreviewed
-      shell: pwsh
       # A rebase onto a new upstream release brings its new tests along.  This
       # fails when one of them applies to Windows and is neither covered by a
       # win32/tests test nor written down as an accepted gap -- so the choice
       # gets made deliberately instead of by omission.  See README "Testing".
+      #
+      # It reads the source and nothing else, so one architecture running it
+      # is the same as three.
+      if: matrix.arch == 'x64'
+      shell: pwsh
       run: |
         python win32/tests/coverage_map.py --check
         if ($LASTEXITCODE -ne 0) { exit 1 }
 
-    - name: Show what was built, and check both are self-contained
+    - name: Show what was built, and check it is self-contained
       shell: pwsh
       run: |
+        $arch = '${{ matrix.arch }}'
+        # x64 keeps the plain names; the other two are suffixed, so all three
+        # can sit in one directory.  CMake and build-openssh.ps1 decide this,
+        # and this is the same rule read back.
+        $sfx   = if ($arch -eq 'x64') { '' } else { "-$arch" }
+        $rsync = "build-$arch\rsync$sfx.exe"
+        $ssh   = "build-$arch\ssh$sfx.exe"
+
         # Each step gets a fresh shell, so the vcvars environment the build
         # step set up is gone and dumpbin is not on PATH.  Find it the way
-        # windows-build-and-test.bat finds the compiler.  The x64 dumpbin
-        # reads a 32-bit image perfectly well, so one copy covers both.
+        # windows-build-and-test.bat finds the compiler.
         $vswhere = "${Env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        $vs = & $vswhere -latest -products * `
-                -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-                -property installationPath
-        $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+        $need = if ($arch -eq 'arm64') { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' }
+                else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+        $vs = & $vswhere -latest -products * -requires $need -property installationPath
+        # dumpbin reads an image of any architecture, so this only picks the
+        # host-native copy to avoid running the x64 one under emulation.
+        $hostDir = if ($Env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'Hostarm64\arm64' } else { 'Hostx64\x64' }
+        $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\$hostDir\dumpbin.exe" |
                     Select-Object -Last 1).FullName
         if (-not $dumpbin) { Write-Error "dumpbin not found under $vs"; exit 1 }
 
-        # Machine type as well as imports: the whole point of shipping two
+        # Machine type as well as imports: the whole point of shipping three
         # binaries is that they are for different architectures, and a build
         # directory that somehow configured for the wrong one would otherwise
-        # sail through as a duplicate of the other.
+        # sail through as a duplicate of another.
+        $machine = @{ 'x64' = 'x64'; 'x86' = 'x86'; 'arm64' = 'ARM64' }[$arch]
+
         # ssh.exe needs a few more of Windows' own DLLs than rsync.exe does
         # (Schannel, the crypto store, the user profile), plus libcrypto.dll,
         # which the Windows OpenSSH Client component installs in System32 --
-        # deliberately not linked in: Windows' build of LibreSSL uses AES-NI,
-        # and rsync.exe's PreferSystem32Images hardening, inherited by the
-        # ssh.exe it starts, takes the System32 copy in any case.
+        # deliberately not linked in: Windows' build of LibreSSL uses the
+        # processor's AES instructions, and rsync.exe's PreferSystem32Images
+        # hardening, inherited by the ssh.exe it starts, takes the System32
+        # copy in any case.  The list is what any of the three may import, not
+        # what each must: an ARM64 ssh.exe pulls in fewer of them.
         $rsyncDlls = '^(WS2_32|ADVAPI32|KERNEL32)\.dll$'
         $sshDlls   = '^(WS2_32|ADVAPI32|KERNEL32|CRYPT32|Secur32|USER32|USERENV|bcrypt|SHLWAPI|ole32|SHELL32|Netapi32|Rpcrt4|ntdll|libcrypto)\.dll$'
         $builds = @(
-          @{ Path = 'build-x64\rsync.exe';             Arch = 'x64'; Machine = 'x64'; Allowed = $rsyncDlls },
-          @{ Path = 'build-x86\rsync-x86.exe';     Arch = 'x86'; Machine = 'x86'; Allowed = $rsyncDlls },
-          @{ Path = 'build-x64\ssh.exe';               Arch = 'x64'; Machine = 'x64'; Allowed = $sshDlls },
-          @{ Path = 'build-x86\ssh-x86.exe';       Arch = 'x86'; Machine = 'x86'; Allowed = $sshDlls }
+          @{ Path = $rsync; Allowed = $rsyncDlls },
+          @{ Path = $ssh;   Allowed = $sshDlls }
         )
 
         foreach ($b in $builds) {
@@ -150,13 +198,13 @@ jobs:
           Write-Host "  LegalCopyright : $($vi.LegalCopyright)"
 
           $headers = & $dumpbin /headers $b.Path
-          $machine = $headers | Select-String -Pattern 'machine \((.+)\)' |
-                     Select-Object -First 1
-          if (-not $machine -or $machine.Matches[0].Groups[1].Value -ne $b.Machine) {
-            Write-Error "$($b.Path) is not a $($b.Machine) image: $machine"
+          $got = $headers | Select-String -Pattern 'machine \((.+)\)' |
+                 Select-Object -First 1
+          if (-not $got -or $got.Matches[0].Groups[1].Value -ne $machine) {
+            Write-Error "$($b.Path) is not a $machine image: $got"
             exit 1
           }
-          Write-Host "  machine        : $($b.Machine)"
+          Write-Host "  machine        : $machine"
 
           $dlls = & $dumpbin /dependents $b.Path |
                   Select-String -Pattern '\.dll' | ForEach-Object { $_.Line.Trim() }
@@ -172,49 +220,40 @@ jobs:
             exit 1
           }
         }
-        Write-Host "all four are self-contained: only Windows' own DLLs are imported"
+        Write-Host "both $arch binaries are self-contained: only Windows' own DLLs are imported"
 
     - name: Stage the files to ship
       shell: pwsh
       run: |
-        $ver    = (Get-Item build-x64\rsync.exe).VersionInfo.ProductVersion
-        $ver86  = (Get-Item build-x86\rsync-x86.exe).VersionInfo.ProductVersion
-
-        # One release, one version: both binaries come out of the same
-        # checkout, so a disagreement means one of the two build directories
-        # is stale and the release would be labelled for only one of them.
-        if ($ver -ne $ver86) {
-          Write-Error "version mismatch: x64 is $ver, x86 is $ver86"
-          exit 1
-        }
+        $arch = '${{ matrix.arch }}'
+        $sfx  = if ($arch -eq 'x64') { '' } else { "-$arch" }
+        $ver  = (Get-Item "build-$arch\rsync$sfx.exe").VersionInfo.ProductVersion
 
         # One zip per architecture, and the same names inside each: rsync.exe
         # and the ssh.exe it runs belong together, and a release asset list
         # is flat -- no directories -- so the architecture goes in the zip's
-        # name rather than the files'.  The -x86 suffixes the build gives its
+        # name rather than the files'.  The suffixes the build gives its
         # outputs stop at the zip boundary.
-        New-Item -ItemType Directory dist, stage\x64, stage\x86 | Out-Null
-        Copy-Item build-x64\rsync.exe            stage\x64\rsync.exe
-        Copy-Item build-x64\ssh.exe              stage\x64\ssh.exe
-        Copy-Item build-x86\rsync-x86.exe    stage\x86\rsync.exe
-        Copy-Item build-x86\ssh-x86.exe      stage\x86\ssh.exe
-        foreach ($a in 'x64', 'x86') {
-          Copy-Item COPYING              "stage\$a\COPYING.txt"
-          Copy-Item build-x64\NOTICE-ssh.txt "stage\$a\NOTICE-ssh.txt"
-          # The installer, so an unpacked zip sets itself up: run from beside
-          # rsync.exe the script installs those files instead of downloading.
-          Copy-Item setup-windows-rsync.ps1 "stage\$a\setup-windows-rsync.ps1"
-          Copy-Item setup-windows-rsync.bat "stage\$a\setup-windows-rsync.bat"
-          # As .txt: it is plain text, and .txt opens with a double-click on
-          # any Windows, where .md asks what to open it with.
-          Copy-Item RELEASE-NOTES.md "stage\$a\RELEASE-NOTES.txt"
-          $zip = "rsync-windows-$a.zip"
-          Compress-Archive -Path "stage\$a\*" -DestinationPath "dist\$zip" -CompressionLevel Optimal
-          $hash = (Get-FileHash "dist\$zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zip" | Out-File -Encoding ascii "dist\$zip.sha256"
-          Write-Host "$zip  $hash"
-        }
-        Copy-Item build-x64\NOTICE-ssh.txt dist\
+        New-Item -ItemType Directory dist, stage | Out-Null
+        Copy-Item "build-$arch\rsync$sfx.exe" stage\rsync.exe
+        Copy-Item "build-$arch\ssh$sfx.exe"   stage\ssh.exe
+        Copy-Item COPYING                     stage\COPYING.txt
+        Copy-Item "build-$arch\NOTICE-ssh.txt" stage\NOTICE-ssh.txt
+        # The installer, so an unpacked zip sets itself up: run from beside
+        # rsync.exe the script installs those files instead of downloading.
+        Copy-Item setup-windows-rsync.ps1 stage\
+        Copy-Item setup-windows-rsync.bat stage\
+        # As .txt: it is plain text, and .txt opens with a double-click on
+        # any Windows, where .md asks what to open it with.
+        Copy-Item RELEASE-NOTES.md stage\RELEASE-NOTES.txt
+
+        $zip = "rsync-windows-$arch.zip"
+        Compress-Archive -Path stage\* -DestinationPath "dist\$zip" -CompressionLevel Optimal
+        $hash = (Get-FileHash "dist\$zip" -Algorithm SHA256).Hash.ToLower()
+        "$hash  $zip" | Out-File -Encoding ascii "dist\$zip.sha256"
+        Write-Host "$zip  $hash"
+
+        Copy-Item "build-$arch\NOTICE-ssh.txt" dist\
         Copy-Item BUILD-CMAKE.md dist\
         Copy-Item RELEASE-NOTES.md dist\RELEASE-NOTES.txt
 
@@ -222,7 +261,7 @@ jobs:
         # a .pdb names every source path and function of the build that made
         # it.  Nothing above copies one -- every staged file is named, none
         # comes from a wildcard over a build directory -- so this is a guard
-        # against a later edit that does, and it covers the zips themselves
+        # against a later edit that does, and it covers the zip itself
         # rather than trusting the copy list.
         $bad = @()
         foreach ($z in Get-ChildItem dist\*.zip) {
@@ -235,9 +274,126 @@ jobs:
           Write-Error "debug symbols in the release: $($bad -join ', ')"
           exit 1
         }
-        Write-Host "no .pdb in the zips or in dist"
+        Write-Host "no .pdb in the zip or in dist"
+
+        # What the release job needs to know, since it never sees the
+        # binaries: which rsync this is, and which ssh.exe went with it.  It
+        # checks the three architectures agree before publishing anything.
+        #
+        # ssh -V is only run where this machine can run it, and it doubles as
+        # a smoke test that the binary starts.  The x86 one cannot start on a
+        # 64-bit Windows -- System32 holds a 64-bit libcrypto.dll and there is
+        # no 32-bit one for it -- so it is not asked.  For the other two a
+        # failure is reported rather than fatal: what it would most likely
+        # mean is that this runner image has no OpenSSH Client component and
+        # so no libcrypto.dll, which is not something this build controls.
+        # The version string is the same for all three anyway, out of the same
+        # pinned submodule, and the release job takes it from whichever builds
+        # could speak for themselves.
+        $sshVer = ''
+        if ($arch -ne 'x86') {
+          try { $sshVer = ((& "build-$arch\ssh$sfx.exe" -V 2>&1) -join '') }
+          catch { Write-Warning "ssh -V did not run here: $_" }
+        }
+        @("VER=$ver", "SSH_VER=$sshVer", "ARCH=$arch") |
+          Out-File -Encoding ascii dist\build-info.txt
         "VER=$ver" >>$Env:GITHUB_ENV
-        "SSH_VER=$((& build-x64\ssh.exe -V 2>&1) -join '')" >>$Env:GITHUB_ENV
+        Write-Host "staged rsync $ver for $arch"
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v7
+      with:
+        # Every run gets one per architecture, tagged or not: this is how a
+        # build is downloaded between releases now that pushes no longer
+        # publish one, and downloading only the architecture you are on is
+        # the common case.
+        #
+        # Loose files, not an archive: upload-artifact always zips what it is
+        # given, so handing it a zip produced a zip inside a zip.  The
+        # artifact name is what GitHub calls the zip it builds.
+        name: rsync-${{ env.VER }}-windows-${{ matrix.arch }}
+        path: dist/*
+        if-no-files-found: error
+
+  release:
+    # Tag pushes only, and only once all three architectures are built and
+    # tested.  A push to the branch builds and uploads artifacts but publishes
+    # nothing, so the Releases page lists the rsyncs this port has shipped
+    # rather than every commit.  Never for pull requests: a PR from a fork must
+    # not be able to publish.
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    needs: build
+    runs-on: windows-2022
+    name: publish
+    steps:
+    # No checkout: everything this job ships came out of the build jobs, and
+    # gh talks to the repository named in GH_REPO.
+    - uses: actions/download-artifact@v7
+      with:
+        pattern: rsync-*-windows-*
+        path: artifacts
+
+    - name: Gather the three builds, and check they agree
+      shell: pwsh
+      run: |
+        # The artifact names carry the version, which this job does not know
+        # yet, so find the files rather than the directories.
+        $zips = @(Get-ChildItem artifacts -Recurse -Filter 'rsync-windows-*.zip')
+        $want = 'x64', 'x86', 'arm64'
+        $got  = @($zips | ForEach-Object { $_.BaseName -replace '^rsync-windows-', '' } | Sort-Object)
+        if (($got -join ',') -ne (($want | Sort-Object) -join ',')) {
+          Write-Error "expected one zip per architecture ($($want -join ', ')), found: $($got -join ', ')"
+          exit 1
+        }
+
+        # One release, one version: all three come out of the same commit, so
+        # a disagreement means one build directory is stale and the release
+        # would be labelled for only some of what is in it.
+        $infos = @{}
+        foreach ($f in Get-ChildItem artifacts -Recurse -Filter 'build-info.txt') {
+          $kv = @{}
+          foreach ($line in Get-Content $f.FullName) {
+            if ($line -match '^([A-Z_]+)=(.*)$') { $kv[$Matches[1]] = $Matches[2] }
+          }
+          $infos[$kv['ARCH']] = $kv
+          Write-Host "$($kv['ARCH']): rsync $($kv['VER'])  ssh '$($kv['SSH_VER'])'"
+        }
+        $vers = @($infos.Values | ForEach-Object { $_['VER'] } | Sort-Object -Unique)
+        if ($vers.Count -ne 1) {
+          Write-Error "the architectures were built from different sources: $($vers -join ', ')"
+          exit 1
+        }
+        $ver = $vers[0]
+
+        # ssh -V from the builds that could run it -- see the staging step.
+        $sshVers = @($infos.Values | ForEach-Object { $_['SSH_VER'] } |
+                     Where-Object { $_ } | Sort-Object -Unique)
+        if ($sshVers.Count -ne 1) {
+          Write-Error "the ssh.exe builds disagree about their version: $($sshVers -join ' | ')"
+          exit 1
+        }
+
+        # The licence text travels inside every zip and once beside them, so
+        # the three copies had better be one text.
+        $notices = @(Get-ChildItem artifacts -Recurse -Filter 'NOTICE-ssh.txt' |
+                     ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash } |
+                     Sort-Object -Unique)
+        if ($notices.Count -ne 1) {
+          Write-Error "NOTICE-ssh.txt differs between architectures"
+          exit 1
+        }
+
+        New-Item -ItemType Directory dist | Out-Null
+        foreach ($z in $zips) {
+          Copy-Item $z.FullName dist\
+          Copy-Item "$($z.FullName).sha256" dist\
+        }
+        $x64 = ($zips | Where-Object { $_.Name -eq 'rsync-windows-x64.zip' }).Directory.FullName
+        Copy-Item (Join-Path $x64 'NOTICE-ssh.txt')    dist\
+        Copy-Item (Join-Path $x64 'RELEASE-NOTES.txt') dist\
+
+        "VER=$ver"              >>$Env:GITHUB_ENV
+        "SSH_VER=$($sshVers[0])" >>$Env:GITHUB_ENV
 
         # <upstream release>-g<port rev>.  The release half comes from
         # version.h and the rev names the commit here that built it, so the
@@ -250,26 +406,11 @@ jobs:
           "RSYNC_VER_BASE=$ver" >>$Env:GITHUB_ENV
           "RSYNC_VER_PORT="     >>$Env:GITHUB_ENV
         }
-        Write-Host "staged rsync $ver, x64 and x86"
-
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v7
-      with:
-        # Every run gets one, tagged or not: this is how a build is downloaded
-        # between releases now that pushes no longer publish one.
-        #
-        # Loose files, not an archive: upload-artifact always zips what it is
-        # given, so handing it a zip produced a zip inside a zip.  The
-        # artifact name is what GitHub calls the zip it builds.
-        name: rsync-${{ env.VER }}-windows
-        path: dist/*
-        if-no-files-found: error
+        Write-Host "gathered rsync $ver for $($got -join ', ')"
 
     - name: Check the tag is one this source may be released under
-      # Only tag pushes get this far, and only tag pushes publish.  Both checks
-      # exist because the tag is written by hand: it is the one input to this
-      # workflow that nothing else validates.
-      if: startsWith(github.ref, 'refs/tags/v')
+      # Both checks exist because the tag is written by hand: it is the one
+      # input to this workflow that nothing else validates.
       shell: pwsh
       run: |
         $tag = $Env:GITHUB_REF_NAME
@@ -295,14 +436,10 @@ jobs:
         Write-Host "tag $tag agrees with the build: rsync $Env:RSYNC_VER_BASE, port rev $Env:RSYNC_VER_PORT"
 
     - name: Publish release
-      # Tag pushes only.  A push to the branch builds and uploads an artifact
-      # but publishes nothing, so the Releases page lists the rsyncs this port
-      # has shipped rather than every commit.  Never for pull requests: a PR
-      # from a fork must not be able to publish.
-      if: startsWith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
       shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
       run: |
         # `gh release view` exits non-zero when the release is absent, which is
         # a question here rather than a failure.  The runner sets
@@ -330,22 +467,25 @@ jobs:
         # paragraph is one line, and the browser wraps it to whatever width it
         # actually has.
         $notes = @"
-        Native Windows build of rsync $Env:RSYNC_VER_BASE, for 64-bit and 32-bit Windows.
+        Native Windows build of rsync $Env:RSYNC_VER_BASE, for 64-bit, 32-bit and ARM64 Windows.
 
         ## Downloads
 
         | download | for |
         | --- | --- |
-        | ``rsync-windows-x64.zip`` | 64-bit Windows -- the one to take unless you know you need the other |
+        | ``rsync-windows-x64.zip`` | 64-bit Intel/AMD Windows -- the one to take unless you know you need another |
+        | ``rsync-windows-arm64.zip`` | Windows on ARM (Snapdragon and the like), built and tested natively |
         | ``rsync-windows-x86.zip`` | 32-bit Windows |
 
-        Each zip holds ``rsync.exe``, the ``ssh.exe`` it runs (see below), ``COPYING.txt``, ``NOTICE-ssh.txt``, ``RELEASE-NOTES.txt`` (the short version of this page), and an installer: ``setup-windows-rsync.bat`` with the ``setup-windows-rsync.ps1`` it runs. Unpack the zip anywhere and double-click the ``.bat``: it asks for elevation, copies the files to ``C:\Tools\rsync``, puts that on the machine ``PATH``, and sets up the OpenSSH client, ``ssh-agent`` and (unless ``-SkipServer``) ``sshd``. Or skip the installer and just unpack into a directory on your ``PATH``, keeping the two exes together. Same source, same options, same behaviour: the two zips differ only in the architecture they were compiled for, and each has a ``.sha256`` beside it.
+        Each zip holds ``rsync.exe``, the ``ssh.exe`` it runs (see below), ``COPYING.txt``, ``NOTICE-ssh.txt``, ``RELEASE-NOTES.txt`` (the short version of this page), and an installer: ``setup-windows-rsync.bat`` with the ``setup-windows-rsync.ps1`` it runs. Unpack the zip anywhere and double-click the ``.bat``: it asks for elevation, copies the files to ``C:\Tools\rsync``, puts that on the machine ``PATH``, and sets up the OpenSSH client, ``ssh-agent`` and (unless ``-SkipServer``) ``sshd``. Or skip the installer and just unpack into a directory on your ``PATH``, keeping the two exes together. Same source, same options, same behaviour: the three zips differ only in the architecture they were compiled for, and each has a ``.sha256`` beside it. An ARM64 machine will run the x64 build under emulation, but the ARM64 one is the one to take there: it runs natively, and its ``ssh.exe`` can load the ARM64 ``libcrypto.dll`` that its Windows has.
 
         ## Why an ssh.exe
 
-        rsync runs its remote end through ssh, and on Windows that means Microsoft's OpenSSH client. The one Windows ships reads its stdin 3KB at a time with a thread per read, which holds a transfer *from* a Windows machine at about 17MB/s no matter how fast the link is. This ``ssh.exe`` is the same client -- $Env:SSH_VER, built from the pinned ``openssh/`` submodule -- with that fixed, and with three more costs that only show on a fast link removed: a thread created for every write to stdout, a named pipe created for every pass through the main loop by OpenSSH's portable ``pselect()`` fallback, and socket sends and receives done on the crypto thread rather than on threads of their own, plus two staging copies per byte, a packet buffer freed and reallocated per packet, and a kernel mutex taken for every packet's random padding; and AES-GCM runs through Intel's ISA-L assembly rather than LibreSSL's EVP -- worth about 4% on a cold machine, and rather more on a warm one: held at line rate for three minutes on a 15W laptop, Windows CNG gives up 6-11% of its throughput to thermal throttling where ISA-L gives up 1%, at the same clock and the same temperature (``SSH_AESGCM_BACKEND=cng`` picks CNG, ``=libcrypto`` the original EVP path, and ``ssh -vvv`` says which one it is using; the assembly is 64-bit, so this is the x64 download and the x86 one keeps CNG). rsync.exe passes it a transfer's bulk data through a shared-memory ring rather than a kernel pipe -- two copies per byte instead of four, no system call per chunk, and a fifth of the processor time of a push gone; both ends fall back to the pipe if the other does not answer. rsync.exe prefers it automatically when it sits in the same directory: with it, a transfer runs at the speed of the link on Ethernet, and at ~1.5GB/s sending and ~1.26GB/s receiving over 20Gbit Thunderbolt networking (rsync ~1GB/s pushing, ~980MB/s pulling). Everything else about it is Microsoft's: it uses the same ``~/.ssh``, the same ssh-agent, the same known_hosts. An ``-e`` naming a different ssh by path is used as given.
+        rsync runs its remote end through ssh, and on Windows that means Microsoft's OpenSSH client. The one Windows ships reads its stdin 3KB at a time with a thread per read, which holds a transfer *from* a Windows machine at about 17MB/s no matter how fast the link is. This ``ssh.exe`` is the same client -- $Env:SSH_VER, built from the pinned ``openssh/`` submodule -- with that fixed, and with three more costs that only show on a fast link removed: a thread created for every write to stdout, a named pipe created for every pass through the main loop by OpenSSH's portable ``pselect()`` fallback, and socket sends and receives done on the crypto thread rather than on threads of their own, plus two staging copies per byte, a packet buffer freed and reallocated per packet, and a kernel mutex taken for every packet's random padding. rsync.exe passes it a transfer's bulk data through a shared-memory ring rather than a kernel pipe -- two copies per byte instead of four, no system call per chunk, and a fifth of the processor time of a push gone; both ends fall back to the pipe if the other does not answer. rsync.exe prefers it automatically when it sits in the same directory: with it, a transfer runs at the speed of the link on Ethernet, and at ~1.5GB/s sending and ~1.26GB/s receiving over 20Gbit Thunderbolt networking (rsync ~1GB/s pushing, ~980MB/s pulling). Everything else about it is Microsoft's: it uses the same ``~/.ssh``, the same ssh-agent, the same known_hosts. An ``-e`` naming a different ssh by path is used as given.
 
-        It needs the **OpenSSH Client** Windows component (Settings > Optional features; ``setup-windows-rsync.ps1`` installs it), because it uses the ``libcrypto.dll`` that component puts in System32 -- Windows' own build of LibreSSL, which uses AES-NI and runs AES at several GB/s -- for everything but the AES-GCM bulk cipher. That is deliberate: rsync.exe's process hardening makes an ssh.exe it starts take the System32 copy regardless, and a LibreSSL built from source for this release ran AES in software at a tenth of the speed. No DLL ships with it, so the 32-bit build is for 32-bit Windows, where System32 holds a 32-bit libcrypto.dll. It is built against the same LibreSSL 3.8.2 that Windows ships (OpenSSH Client 9.5 and later), with the same mitigations as rsync.exe -- CFG, CET, ``/sdl``, ``/Qspectre`` -- and with zlib linked in. Everything in it is under a permissive licence -- OpenSSH (BSD), Microsoft's Win32 layer (BSD), zlib -- and every text is in the attached ``NOTICE-ssh.txt``.
+        The bulk cipher, AES-GCM, does not go through LibreSSL's EVP in any of the three. The x64 build runs it through Intel's ISA-L assembly -- worth about 4% on a cold machine, and rather more on a warm one: held at line rate for three minutes on a 15W laptop, Windows CNG gives up 6-11% of its throughput to thermal throttling where ISA-L gives up 1%, at the same clock and the same temperature. The x86 and ARM64 builds use Windows CNG, and on ARM64 that is not a fallback but the right answer: CNG there runs AES-128-GCM about 50x faster than the ``libcrypto.dll`` Windows ships for ARM64, which carries no ARM64 assembly at all, and about twice as fast as a hand-written NEON implementation using the same ARMv8 crypto instructions. ``SSH_AESGCM_BACKEND=cng`` forces CNG, ``=libcrypto`` the original EVP path, and ``ssh -vvv`` says which one it is using.
+
+        It needs the **OpenSSH Client** Windows component (Settings > Optional features; ``setup-windows-rsync.ps1`` installs it), because it uses the ``libcrypto.dll`` that component puts in System32 for everything but the bulk cipher -- key exchange, signatures and digests. No DLL ships with it, so each download is for the Windows whose System32 holds a ``libcrypto.dll`` of that architecture. It is built against the same LibreSSL 3.8.2 that Windows ships (OpenSSH Client 9.5 and later), with the same mitigations as rsync.exe -- CFG, ``/sdl``, ``/Qspectre``, and CET on the two x86 builds, which is the one mitigation ARM64 has no equivalent of -- and with zlib linked in. Everything in it is under a permissive licence -- OpenSSH (BSD), Microsoft's Win32 layer (BSD), zlib -- and every text is in the attached ``NOTICE-ssh.txt``.
 
         ## Reading the version
 
@@ -360,9 +500,9 @@ jobs:
 
         ``ssh.exe`` reports its own version (``ssh -V``): $Env:SSH_VER.
 
-        Releases here are cut only from upstream **releases**. This repository is the Windows adaptation layer for rsync: the first half of the version says which rsync you are getting, the second says which revision of the Windows work built it. A new upstream release moves the first; a fix to the port moves the second. ``rsync --version`` prints the same string, and both binaries carry it in their file properties.
+        Releases here are cut only from upstream **releases**. This repository is the Windows adaptation layer for rsync: the first half of the version says which rsync you are getting, the second says which revision of the Windows work built it. A new upstream release moves the first; a fix to the port moves the second. ``rsync --version`` prints the same string, and all three binaries carry it in their file properties.
 
-        Builds between releases are not published here. Every push to ``windows-cmake-port`` is still built and tested, and its binaries are attached to that run under **Actions** if you want one.
+        Builds between releases are not published here. Every push to ``windows-cmake-port`` is still built and tested -- each architecture on a runner of that architecture -- and its binaries are attached to that run under **Actions** if you want one.
 
         ## Verifying a download
 
@@ -374,13 +514,14 @@ jobs:
 
         ## Notes
 
-        No Visual C++ redistributable is needed by either build: the C runtime is linked in, and the only imports are WS2_32, ADVAPI32 and KERNEL32, all of which ship with Windows.
+        No Visual C++ redistributable is needed by any of the builds: the C runtime is linked in, and the only imports are WS2_32, ADVAPI32 and KERNEL32, all of which ship with Windows.
 
         Source, licence (GPL-3.0-or-later), and what is and is not supported are in this repository -- see BUILD-CMAKE.md. Symlinks, hard links, daemon mode, ACLs and xattrs are **not** supported on Windows.
         "@
 
         gh release create $tag `
           dist\rsync-windows-x64.zip dist\rsync-windows-x64.zip.sha256 `
+          dist\rsync-windows-arm64.zip dist\rsync-windows-arm64.zip.sha256 `
           dist\rsync-windows-x86.zip dist\rsync-windows-x86.zip.sha256 `
           dist\NOTICE-ssh.txt dist\RELEASE-NOTES.txt `
           --title "rsync $Env:RSYNC_VER_BASE for Windows" `

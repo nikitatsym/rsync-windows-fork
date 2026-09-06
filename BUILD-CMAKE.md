@@ -54,17 +54,24 @@ windows-build-and-test.bat
 ```
 
 That finds the MSVC toolchain with `vswhere` (so no Developer Command Prompt
-is needed), then configures, builds and tests **both** architectures in turn:
+is needed), then configures, builds and tests **all three** architectures in
+turn:
 
 | Architecture | Build directory | Binary |
 | --- | --- | --- |
-| x64 (default) | `build-x64\` | `rsync.exe` |
+| x64 | `build-x64\` | `rsync.exe` |
 | x86 | `build-x86\` | `rsync-x86.exe` |
+| ARM64 | `build-arm64\` | `rsync-arm64.exe` |
 
 Ninja generates for one compiler, and which compiler that is comes from the
-environment vcvars set up, so the two cannot share a configure — the script
+environment vcvars set up, so the three cannot share a configure — the script
 calls itself once per architecture instead, each call with its own vcvars and
-its own build directory. `--arch x64` or `--arch x86` builds just the one.
+its own build directory. `--arch x64`, `--arch x86` or `--arch arm64` builds
+just the one; `--arch all` is the default and `--arch both` still means the
+two it always did. A build only gets its test suite run where this machine can
+execute it: an ARM64 binary is built but not tested on an x64 host, where
+nothing can run it, while an ARM64 host runs and tests all three, since Windows
+on ARM emulates x86 and x64.
 Other useful options: `--clean`, `--config Debug`, `--build-dir DIR`,
 `--no-tests`, `--tests PATTERN`, and `--host USER@HOST` to include the ssh
 transfer tests. It exits 0 on success, 1 on failure, 2 on a usage error.
@@ -78,11 +85,12 @@ cmake --build build
 .\build-x64\rsync.exe --version
 ```
 
-Both binaries are self-contained — no Cygwin or MSYS DLLs — and identical but
-for the architecture they were compiled for. They use the Windows OpenSSH
+All three binaries are self-contained — no Cygwin or MSYS DLLs — and identical
+but for the architecture they were compiled for. They use the Windows OpenSSH
 client (`C:\Windows\System32\OpenSSH\ssh.exe`) as their remote shell. Take the
-x64 build unless you are on 32-bit Windows, or something in the way you are
-invoking rsync will only load a 32-bit image.
+one for the machine: the x64 build unless you are on Windows on ARM (take
+ARM64) or 32-bit Windows, or unless something in the way you are invoking rsync
+will only load a 32-bit image.
 
 `rsync-x86.exe` reaches that ssh through `%WINDIR%\Sysnative`. On 64-bit
 Windows the WOW64 redirector points a 32-bit process at `SysWOW64` whenever it
@@ -157,16 +165,29 @@ fails loudly rather than silently:
 To build it:
 
     git submodule update --init --depth 1 openssh
-    .\win32\openssh\build-openssh.ps1 -Arch both
+    .\win32\openssh\build-openssh.ps1 -Arch all
 
 The script applies the patches once, fetches the prebuilt LibreSSL 3.8.2 and
-zlib SDKs Microsoft publishes for Win32-OpenSSH (pinned by SHA-256), runs
-MSBuild on the OpenSSH projects, and leaves `build-x64\ssh.exe` beside
-`rsync.exe` — which means the ssh transfer tests, run with `--host`, exercise
-the bundled client — and `build-x86\ssh-x86.exe` (the release packs each
-pair as `rsync.exe` + `ssh.exe` in a per-architecture zip). Both carry the same
-mitigations as rsync.exe (CFG, CET, `/sdl`, `/Qspectre`; see below) and a
-static CRT, with zlib linked in.
+zlib SDKs Microsoft publishes for Win32-OpenSSH (pinned by SHA-256, and
+carrying an import library for each of the three architectures), runs MSBuild
+on the OpenSSH projects, and leaves `build-x64\ssh.exe` beside `rsync.exe` —
+which means the ssh transfer tests, run with `--host`, exercise the bundled
+client — with `build-x86\ssh-x86.exe` and `build-arm64\ssh-arm64.exe` beside
+theirs (the release packs each pair as `rsync.exe` + `ssh.exe` in a
+per-architecture zip). All three carry the same mitigations as rsync.exe (CFG,
+`/sdl`, `/Qspectre`, and CET on the two x86 ones; see below) and a static CRT,
+with zlib linked in.
+
+The ISA-L AES-GCM backend is x86-64 assembly, so the x86 and ARM64 builds use
+Windows CNG for the bulk cipher. On ARM64 that is the right backend and not a
+consolation: measured on Windows on ARM, CNG runs AES-128-GCM at ~8.8 GB/s in
+SSH's 32 KB packets, against ~180 MB/s for the ARM64 `libcrypto.dll` Windows
+ships — which, unlike the x64 one, carries no architecture assembly at all —
+and ~4.7 GB/s for a hand-written NEON implementation of the same ARMv8 crypto
+instructions. `optimization/harness/cipherlibs_arm64.ps1` measures it and
+`windows-perf-arm64-cipher-libs.png` is the picture; the hand-written one is in
+`optimization/bench/gcmsustain_arm64.c`, where it has to produce CNG's exact
+ciphertext and tag before it is allowed to report a number.
 
 LibreSSL is *not* linked in. `ssh.exe` loads the `libcrypto.dll` that the
 Windows **OpenSSH Client** component installs in `System32` — Windows' own

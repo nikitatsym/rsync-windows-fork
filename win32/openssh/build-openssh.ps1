@@ -28,13 +28,18 @@
     140MB/s for a LibreSSL built from source with the vcpkg port -- and
     rsync.exe's PreferSystem32Images hardening, which its children inherit,
     means an ssh.exe started by rsync takes the System32 copy in any case.
-    So no DLL ships, for either architecture: the 32-bit build is for 32-bit
-    Windows, whose System32 holds a 32-bit libcrypto.dll.
+    So no DLL ships, for any of the three architectures: each loads the
+    libcrypto.dll of its own architecture from the System32 of the Windows it
+    is meant for.
 
     zlib comes from the same place, prebuilt, and is linked statically.
 
 .PARAMETER Arch
-    x64 (default), x86, or both.
+    x64 (default), x86, arm64, all, or both (x64 and x86, which is what "all"
+    meant when there were only two).
+
+    The ISA-L AES-GCM assembly is x86-64, so an x86 or ARM64 ssh.exe uses
+    Windows CNG for the bulk cipher, as it did before that backend existed.
 
 .PARAMETER Configuration
     Release (default) or Debug.
@@ -44,21 +49,23 @@
     in the repository, which is ignored by git.
 
 .PARAMETER Out
-    Where the binary lands.  Default: build-x64\ssh.exe for x64, so the ssh
-    transfer tests run with it, and build-x86\ssh-x86.exe for x86 -- under a
-    name rsync-x86.exe does not pick up, because on the 64-bit machine that
-    builds it there is no 32-bit libcrypto.dll for it to load.
+    Where the binary lands.  Default: build-<arch>, beside the rsync.exe of
+    that architecture, so the ssh transfer tests run with it.  The name
+    follows rsync's: ssh.exe for x64, ssh-x86.exe and ssh-arm64.exe for the
+    others -- suffixed, so an rsync.exe does not pick up an ssh.exe it cannot
+    use.  A build machine has the System32 libcrypto.dll of its own
+    architecture and no other, so only the native pair is runnable there.
 
 .PARAMETER Clean
     Rebuild the OpenSSH projects from scratch.
 
 .EXAMPLE
     .\win32\openssh\build-openssh.ps1
-    .\win32\openssh\build-openssh.ps1 -Arch both
+    .\win32\openssh\build-openssh.ps1 -Arch all
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('x64', 'x86', 'both')]
+    [ValidateSet('x64', 'x86', 'arm64', 'all', 'both')]
     [string] $Arch = 'x64',
     [ValidateSet('Release', 'Debug')]
     [string] $Configuration = 'Release',
@@ -66,9 +73,11 @@ param(
     [string] $Out,
     [switch] $Clean,
     # Fail rather than quietly fall back to CNG when NASM is missing.  The
-    # release workflow passes this: a release that silently shipped ssh.exe
-    # without the ISA-L AES-GCM would look identical and run 8-11% slower
-    # once the machine is hot, which is not a thing to find out afterwards.
+    # release workflow passes this for the x64 build: a release that silently
+    # shipped ssh.exe without the ISA-L AES-GCM would look identical and run
+    # 8-11% slower once the machine is hot, which is not a thing to find out
+    # afterwards.  It says nothing about x86 or ARM64, where the assembly does
+    # not apply and CNG is the backend by design.
     [switch] $RequireIsal
 )
 
@@ -184,13 +193,20 @@ if ($Clean) {
 }
 
 # -------------------------------------------------------------------- build
-$archs = if ($Arch -eq 'both') { 'x64', 'x86' } else { @($Arch) }
+$archs = switch ($Arch) {
+    'all'   { 'x64', 'x86', 'arm64' }
+    'both'  { 'x64', 'x86' }        # what "all" meant with two architectures
+    default { @($Arch) }
+}
 $built = @()
 foreach ($a in $archs) {
     $triplet  = "$a-custom"
-    $platform = if ($a -eq 'x86') { 'Win32' } else { 'x64' }
-    $exeName  = if ($a -eq 'x86') { 'ssh-x86.exe' } else { 'ssh.exe' }
-    $outDir   = if ($Out) { $Out } elseif ($a -eq 'x86') { Join-Path $repo 'build-x86' } else { Join-Path $repo 'build-x64' }
+    # The names MSBuild and rsync each use for the same thing.  Win32-OpenSSH's
+    # projects carry Win32, x64 and ARM64 configurations; "Win32" is the one
+    # that is not spelled the way anything else here spells it.
+    $platform = switch ($a) { 'x86' { 'Win32' } 'arm64' { 'ARM64' } default { 'x64' } }
+    $exeName  = if ($a -eq 'x64') { 'ssh.exe' } else { "ssh-$a.exe" }
+    $outDir   = if ($Out) { $Out } else { Join-Path $repo "build-$a" }
 
     # The projects look for headers and libraries where vcpkg's manifest mode
     # would have put them.  Nothing here uses vcpkg; the SDK is laid out in
@@ -204,9 +220,10 @@ foreach ($a in $archs) {
     Copy-Item (Join-Path $zlib "bin\$a\zlib.lib") (Join-Path $dep 'lib\zs.lib') -Force
 
     # The ISA-L objects, if NASM is here and we are building x64 (the
-    # assembly is win64 only).  They go into the link of ssh.exe and turn on
-    # the backend in win32isalgcm.c; without them that file compiles to a
-    # stub that says "not available" and CNG carries on.
+    # assembly is win64 only -- an x86 or ARM64 build never has them).  They
+    # go into the link of ssh.exe and turn on the backend in win32isalgcm.c;
+    # without them that file compiles to a stub that says "not available" and
+    # CNG carries on.
     $isalObjs = @()
     if ($nasm -and $a -eq 'x64') {
         Step "${a}: ISA-L AES-GCM (nasm)"

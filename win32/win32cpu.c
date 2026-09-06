@@ -8,8 +8,11 @@
  */
 
 #include "rsync.h"
-#include <intrin.h>
 #include "win32cpu.h"
+
+#if defined(_M_IX86) || defined(_M_X64)
+
+#include <intrin.h>
 
 static int simd_level = -1;
 
@@ -39,3 +42,16 @@ int win32_simd_level(void)
 	}
 	return simd_level;
 }
+
+#else /* not x86 -- ARM64 */
+
+/* There is nothing to probe: every routine the level selects between is x86,
+ * and CMake leaves both the SIMD get_checksum1() and the AVX2 build of xxHash
+ * out of an ARM64 build.  The function stays so that t_win32checksum, which
+ * reports the level it ran at, links and says "scalar". */
+int win32_simd_level(void)
+{
+	return WIN32_SIMD_SCALAR;
+}
+
+#endif

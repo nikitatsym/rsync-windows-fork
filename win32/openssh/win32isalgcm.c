@@ -37,8 +37,6 @@
 #include "includes.h"
 
 #include <windows.h>
-#include <intrin.h>
-#include <wmmintrin.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -46,6 +44,12 @@
 #include "win32isalgcm.h"
 
 #ifdef RSYNC_ISAL_GCM
+
+/* Inside the guard: this is AES-NI, and <wmmintrin.h> does not exist for an
+ * ARM64 build -- which is a build without the assembly, so it takes the stub
+ * at the bottom of this file and stays on CNG. */
+#include <intrin.h>
+#include <wmmintrin.h>
 
 /* ---- the layout gcm_avx_gen4.asm expects (isa-l_crypto aes_gcm.h) ----- */
 

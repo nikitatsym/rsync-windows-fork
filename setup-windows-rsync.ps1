@@ -296,14 +296,38 @@ if ($SkipServer) {
 # 4. rsync
 #
 # Windows ships the ssh transport but no rsync, so the remote end of an
-# `rsync -e ssh` has nothing to run. Install the x64 build on a 64-bit OS and
-# the x86 one otherwise, both under the name rsync.exe: it is what the sending
-# side asks for over the wire, and renaming saves every caller a --rsync-path.
+# `rsync -e ssh` has nothing to run. Install the build for this machine's
+# architecture, under the name rsync.exe: it is what the sending side asks for
+# over the wire, and renaming saves every caller a --rsync-path.
 # ---------------------------------------------------------------------------
 # The architecture a PE image was built for, from its COFF header: 0x8664 is
-# x64, 0x14c is x86.  A zip unpacked by hand is not named by the script, so
-# this is how an x64 rsync.exe on 32-bit Windows is caught before it lands
-# on the PATH and fails to start.
+# x64, 0x14c is x86, 0xAA64 is ARM64.  A zip unpacked by hand is not named by
+# the script, so this is how an x64 rsync.exe on 32-bit Windows is caught
+# before it lands on the PATH and fails to start.
+$PE_MACHINE = @{ 0x8664 = 'x64'; 0x14c = 'x86'; 0xAA64 = 'arm64' }
+
+# What each Windows can actually execute.  64-bit Windows runs 32-bit images
+# through WOW64, and Windows on ARM emulates both x86 and x64; nothing runs an
+# ARM64 image anywhere else.
+$RUNS_ON = @{ 'x64' = @('x64', 'x86'); 'x86' = @('x86'); 'arm64' = @('arm64', 'x64', 'x86') }
+
+# This machine's architecture.  RuntimeInformation is the one that knows about
+# ARM64 -- Is64BitOperatingSystem answers a narrower question and would call an
+# ARM64 machine "64-bit" and hand it the x64 build.  The environment is the
+# fallback for a PowerShell too old to have it, where PROCESSOR_ARCHITECTURE
+# reads x86 inside a 32-bit process and the truth is in PROCESSOR_ARCHITEW6432.
+function Get-OsArch {
+    try {
+        switch ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+            'Arm64' { return 'arm64' }
+            'X64'   { return 'x64' }
+            'X86'   { return 'x86' }
+        }
+    } catch { }
+    $a = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    switch ($a) { 'ARM64' { 'arm64' } 'AMD64' { 'x64' } default { 'x86' } }
+}
+
 function Get-PeMachine([string] $Path) {
     $fs = [IO.File]::OpenRead($Path)
     try {
@@ -321,7 +345,8 @@ Write-Step "rsync for Windows ($Repo)"
 
 # One zip per architecture, holding rsync.exe and the ssh.exe it runs under
 # those names, plus the licence texts.
-$asset     = if ([Environment]::Is64BitOperatingSystem) { 'rsync-windows-x64.zip' } else { 'rsync-windows-x86.zip' }
+$osArch    = Get-OsArch
+$asset     = "rsync-windows-$osArch.zip"
 $target    = Join-Path $InstallDir 'rsync.exe'
 $sshTarget = Join-Path $InstallDir 'ssh.exe'
 
@@ -336,15 +361,20 @@ try {
         if (-not (Test-Path $srcExe)) { throw "no rsync.exe in $Source" }
         if ($Tag -ne 'latest') { Write-Warning "-Tag $Tag ignored: installing the files in $Source" }
         $machine = Get-PeMachine $srcExe
-        $is64    = [Environment]::Is64BitOperatingSystem
-        if ($machine -eq 0x8664 -and -not $is64) {
-            throw "$srcExe is the x64 build and this is 32-bit Windows; unpack rsync-windows-x86.zip instead"
+        $exeArch = $PE_MACHINE[[int]$machine]
+        if (-not $exeArch) {
+            throw ("$srcExe is not a build this script knows " +
+                   ("(PE machine 0x{0:X})" -f $machine))
         }
-        if ($machine -eq 0x14c -and $is64) {
-            # The x86 rsync.exe runs on 64-bit Windows, but its 32-bit ssh.exe
-            # cannot load the 64-bit libcrypto.dll in System32, and there is no
-            # 32-bit one to give it.  Say so, install rsync alone.
-            Write-Warning "$srcExe is the x86 build on 64-bit Windows: rsync.exe will run, but its ssh.exe cannot use System32's 64-bit libcrypto.dll, so rsync will fall back to the ssh on PATH. Unpack rsync-windows-x64.zip for the full speed."
+        if ($RUNS_ON[$osArch] -notcontains $exeArch) {
+            throw "$srcExe is the $exeArch build and this is $osArch Windows, which cannot run it; unpack $asset instead"
+        }
+        if ($exeArch -ne $osArch) {
+            # It runs -- through WOW64, or ARM64's emulation -- but the ssh.exe
+            # beside it cannot: System32 holds one libcrypto.dll and it is this
+            # machine's own architecture, not the binary's.  Say so, install
+            # rsync alone, and let it fall back to the ssh on PATH.
+            Write-Warning "$srcExe is the $exeArch build on $osArch Windows: rsync.exe will run, but its ssh.exe cannot load System32's $osArch libcrypto.dll, so rsync will fall back to the ssh on PATH. Unpack $asset for the full speed."
             $wrongArch = $true
         }
         $resolved = 'v' + (Get-Item $srcExe).VersionInfo.ProductVersion

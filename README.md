@@ -9,18 +9,19 @@ Unix ownership and link *creation* do not (see BUILD-CMAKE.md).
 
     windows-build-and-test.bat
 
-builds it and runs the test suite, for x64 (`build-x64\rsync.exe`) and x86
-(`build-x86\rsync-x86.exe`) in turn. Either result is standalone, importing
-only `WS2_32`, `ADVAPI32` and `KERNEL32` — all shipped with Windows — with the
-C runtime linked in and the usual exploit mitigations enabled (Control Flow
-Guard, CET shadow stack, strict `/GS`, Spectre v1 hardening, ASLR, DEP, and a
-System32-only DLL search path).
+builds it and runs the test suite, for x64 (`build-x64\rsync.exe`), x86
+(`build-x86\rsync-x86.exe`) and ARM64 (`build-arm64\rsync-arm64.exe`) in turn.
+Each result is standalone, importing only `WS2_32`, `ADVAPI32` and `KERNEL32` —
+all shipped with Windows — with the C runtime linked in and the usual exploit
+mitigations enabled (Control Flow Guard, strict `/GS`, Spectre v1 hardening,
+ASLR, DEP, a System32-only DLL search path, and the CET shadow stack on the two
+x86 builds, which is the one of these that ARM64 has no equivalent of).
 
 ### Installing on Windows
 
 Building is optional. Every release on [the releases page][w1] carries
-`rsync-windows-x64.zip` and `rsync-windows-x86.zip` with a `.sha256` beside
-each. A zip holds `rsync.exe` and `ssh.exe`, both self-contained — unpack it
+`rsync-windows-x64.zip`, `rsync-windows-arm64.zip` and
+`rsync-windows-x86.zip` with a `.sha256` beside each. A zip holds `rsync.exe` and `ssh.exe`, both self-contained — unpack it
 somewhere on your `PATH`, keep the two together, and it runs. It also holds
 `setup-windows-rsync.bat` (and the `.ps1` it runs): double-click that from
 the unpacked folder and it installs those files to `C:\Tools\rsync`, puts the
@@ -41,7 +42,8 @@ copies per byte removed, a buffer that was freed and reallocated per packet
 kept, a kernel mutex taken for every packet's random padding replaced, the
 encrypted packet handed to the socket thread rather than copied to it, and
 AES-GCM run through Intel's ISA-L assembly rather than LibreSSL's EVP (the
-x64 build; the x86 one uses Windows CNG, as does any machine without AVX2),
+x64 build; the x86 and ARM64 builds use Windows CNG, which on ARM64 is not a
+fallback but the fast path — see `optimization/charts/ciphercharts_arm64.py`),
 which together took it from ~340MB/s sending and ~220MB/s receiving to
 ~1.5GB/s sending and ~1.26GB/s receiving over 20Gbit Thunderbolt networking.
 The bulk data crosses from `rsync.exe` to it through a shared-memory ring
