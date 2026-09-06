@@ -21,16 +21,18 @@ Needs `matplotlib`. From the repository root:
     python optimization/charts/shmcharts.py    .                      # shared-memory ring
     python optimization/charts/isalcharts.py   .                      # ISA-L, sustained/thermal
     python optimization/charts/ciphercharts.py optimization/data .    # cipher libraries
+    python optimization/charts/ciphercharts_arm64.py optimization/data .  # the same four, Windows on ARM
     python optimization/charts/linkchart.py    optimization/data/iperf-run2 windows-perf-thunderbolt-link-3min
     python optimization/charts/xperfcharts.py  .                      # xperf round + the overall arc
 
-All seven were re-run from this directory to confirm the salvage is complete;
+All eight were re-run from this directory to confirm the salvage is complete;
 between them they reproduce every published chart.
 
 Generators differ in where their figures live, because they were written at
 different times: `perfcharts`, `tbcharts` and `shmcharts` carry their numbers
 inline (taken from commit messages and the porting log), while `ciphercharts`,
-`isalcharts`, `linkchart` and `xperfcharts` read the CSVs in `data/`.
+`ciphercharts_arm64`, `isalcharts`, `linkchart` and `xperfcharts` read the CSVs
+in `data/`.
 
 ## How to read the numbers
 
@@ -42,6 +44,13 @@ base cold and decays past 135% when hot. **Arms of a comparison are therefore
 always interleaved within one session**, and in the later rounds cooled to a
 fixed temperature between rounds. Numbers from different sessions are not
 comparable, and the charts say so where it matters.
+
+One set is not from this laptop at all: the ARM64 cipher comparison
+(`windows-perf-arm64-cipher-libs`, `harness/cipherlibs_arm64.ps1`,
+`bench/gcmsustain_arm64.c`, and the `*_arm64.csv` files) was measured on a
+Windows-on-ARM machine, and there is no transfer anywhere in it — that machine
+has no fast link to push into, so it measures the cipher alone. Its four
+numbers are comparable with each other and with nothing else here.
 
 `data/perflog.csv` is the running log of every headline figure across all the
 sessions — the single most useful file here if you want one number for
