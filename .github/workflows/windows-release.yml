@@ -408,6 +408,71 @@ jobs:
         }
         Write-Host "gathered rsync $ver for $($got -join ', ')"
 
+    - name: Check each zip holds only its own architecture
+      shell: pwsh
+      # The build job already checks the machine type of both binaries it
+      # produced -- but it does that on build-<arch>\, before staging.  Between
+      # there and a release asset sit a copy into stage\, a Compress-Archive, an
+      # artifact upload and a download into this job, so the file that was
+      # verified and the file about to be published are not the same file.  This
+      # reads the machine type back out of the zips themselves, which is the last
+      # point at which it can still be wrong.
+      #
+      # A mislabelled zip is the failure this catches, and every check above it
+      # passes while it happens: the names match, the build-info.txt versions
+      # agree, the NOTICE hashes agree.  Only the bytes disagree, and nothing
+      # else in this workflow looks at them.  Someone on Windows on ARM
+      # downloading the arm64 zip and getting an x64 rsync.exe would be told by
+      # the release page that it was "built and tested natively", which is worse
+      # than shipping two architectures instead of three.
+      #
+      # Every .exe and .dll entry, not just the two expected names: "one arch per
+      # zip" is the invariant, so anything executable that appears in there later
+      # is covered without this needing an edit.
+      #
+      # The COFF header directly rather than dumpbin: this runner is x64 and has
+      # to read an ARM64 image.  dumpbin does that fine, but only after the
+      # vswhere-and-host-toolchain dance the build job needs; the machine field
+      # sits at a fixed offset and needs no toolchain at all.
+      run: |
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $expect = @{ 'x64' = 0x8664; 'x86' = 0x014c; 'arm64' = 0xAA64 }
+        $names  = @{ 0x8664 = 'x64'; 0x014c = 'x86'; 0xAA64 = 'arm64' }
+        $bad = @()
+        foreach ($z in Get-ChildItem dist\rsync-windows-*.zip) {
+          $arch = $z.BaseName -replace '^rsync-windows-', ''
+          if (-not $expect.ContainsKey($arch)) { $bad += "$($z.Name): unknown architecture '$arch'"; continue }
+          $zip = [IO.Compression.ZipFile]::OpenRead($z.FullName)
+          try {
+            $bins = @($zip.Entries | Where-Object { $_.Name -match '\.(exe|dll)$' })
+            if ($bins.Count -eq 0) { $bad += "$($z.Name): holds no binaries"; continue }
+            foreach ($e in $bins) {
+              # Entry streams are deflate and not seekable, so read the front of
+              # the file forward; e_lfanew is a couple of hundred bytes in.
+              $buf = New-Object byte[] 4096
+              $n = 0
+              $s = $e.Open()
+              try { while ($n -lt $buf.Length) { $r = $s.Read($buf, $n, $buf.Length - $n); if ($r -le 0) { break }; $n += $r } }
+              finally { $s.Dispose() }
+              $off = if ($n -ge 0x40) { [BitConverter]::ToUInt32($buf, 0x3c) } else { [uint32]::MaxValue }
+              if ($off + 6 -gt $n -or [BitConverter]::ToUInt32($buf, $off) -ne 0x00004550) {
+                $bad += "$($z.Name): $($e.FullName) is not a PE image"
+                continue
+              }
+              $m   = [BitConverter]::ToUInt16($buf, $off + 4)
+              $got = if ($names.ContainsKey([int]$m)) { $names[[int]$m] } else { '0x{0:X4}' -f $m }
+              Write-Host ("  {0,-26} {1,-14} {2}" -f $z.Name, $e.FullName, $got)
+              if ($m -ne $expect[$arch]) { $bad += "$($z.Name): $($e.FullName) is $got, expected $arch" }
+            }
+          } finally { $zip.Dispose() }
+        }
+        if ($bad) {
+          foreach ($b in $bad) { Write-Host "  MISMATCH: $b" }
+          Write-Error "the release zips are not one architecture each; see the MISMATCH lines above"
+          exit 1
+        }
+        Write-Host 'each zip holds exactly its own architecture'
+
     - name: Check the tag is one this source may be released under
       # Both checks exist because the tag is written by hand: it is the one
       # input to this workflow that nothing else validates.
